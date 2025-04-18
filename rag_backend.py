@@ -12,18 +12,17 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 
 from LLM import LLM
-
 import torch
 import pickle
 import hashlib
+import asyncio
+import json
 
 app = Flask(__name__)
 
 # 根据设备选择推理设备
 device = "cuda" if torch.cuda.is_available() else "cpu"
-# device = "cuda:5"
 model_name = "BAAI/bge-large-zh-v1.5"
-# model_name = "models/bge-large-zh-v1.5"
 model_kwargs = {'device': device}
 encode_kwargs = {'normalize_embeddings': True}  # set True to compute cosine similarity
 embeddings = HuggingFaceBgeEmbeddings(
@@ -55,11 +54,13 @@ if os.path.exists(INDEX_FILE) and os.path.exists(DOCUMENT_BLOCKS_FILE):
         document_blocks = pickle.load(f)
     block_id_counter = max(document_blocks.keys()) + 1 if document_blocks else 0
 
-
 llm = LLM()
 
 
-def load_document(file_url):
+def load_document(file_url: str):
+    """
+    根据文件扩展名加载文档
+    """
     if file_url.endswith('.txt'):
         loader = TextLoader(file_url)
     elif file_url.endswith('.pdf'):
@@ -87,6 +88,9 @@ def load_document(file_url):
 
 
 def chunk_document(docs):
+    """
+    将文档分割为文本块
+    """
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=512,
         chunk_overlap=32,
@@ -96,11 +100,17 @@ def chunk_document(docs):
 
 
 def calculate_embeddings(blocks):
+    """
+    计算文本块的嵌入向量
+    """
     texts = [block.page_content for block in blocks]
     return embeddings.embed_documents(texts)
 
 
 def add_blocks_to_index(doc_id, blocks):
+    """
+    将文本块添加到索引中，并保存索引和文档块信息
+    """
     global block_id_counter
     embeddings_list = calculate_embeddings(blocks)
     embeddings_np = np.array(embeddings_list).astype('float32')
@@ -119,6 +129,9 @@ def add_blocks_to_index(doc_id, blocks):
 
 
 def remove_blocks_from_index(doc_id):
+    """
+    从索引中移除指定文档的文本块，并重新构建索引
+    """
     old_block_ids = [block_id for block_id, (doc_id_, _) in document_blocks.items() if doc_id_ == doc_id]
     for block_id in old_block_ids:
         del document_blocks[block_id]
@@ -138,7 +151,10 @@ def remove_blocks_from_index(doc_id):
         pickle.dump(document_blocks, f)
 
 
-def get_doc_id_from_url(file_url):
+def get_doc_id_from_url(file_url: str) -> str:
+    """
+    根据文件 URL 生成文档 ID
+    """
     return hashlib.sha256(file_url.encode()).hexdigest()
 
 
@@ -193,7 +209,7 @@ def query():
 
 # 1. 日常对话接口，返回 SSE 格式
 @app.route('/chat', methods=['POST'])
-def chat():
+async def chat():
     data = request.get_json()
     query = data.get('query')
     rag_content = data.get('rag_content', "")
@@ -205,16 +221,18 @@ def chat():
     full_prompt = prompt.format(rag_content=rag_content,
                                 query=query)
 
-    def generate():
-        for part in llm.model_chat_flow(full_prompt, is_record=True):
+    async def generate():
+        async for part in llm.model_chat_flow(full_prompt, is_record=True):
             yield f"data: {part}\n\n"
 
-    return Response(generate(), mimetype='text/event-stream')
+    loop = asyncio.get_event_loop()
+    response = Response(loop.run_until_complete(generate()), mimetype='text/event-stream')
+    return response
 
 
 # 2. 使用大模型从需求等各类文档中自动识别出软件的功能
 @app.route('/function_extraction', methods=['POST'])
-def function_extraction():
+async def function_extraction():
     data = request.get_json()
     document = data.get('document')
     rag_content = data.get('rag_content', "")
@@ -224,13 +242,20 @@ def function_extraction():
     prompt = llm.load_prompt("function_extraction")
     full_prompt = prompt.format(rag_content=rag_content,
                                 document=document)
-    result = ''.join(llm.model_chat_flow(full_prompt))
+    result_parts = []
+    async for item in llm.model_chat_flow(full_prompt):
+        try:
+            item_data = json.loads(item.decode("utf-8").strip())
+            result_parts.append(item_data["answer"])
+        except json.JSONDecodeError:
+            pass
+    result = ''.join(result_parts)
     return jsonify({"features": result})
 
 
 # 3. 从需求等文档中对功能进行检索，大模型根据检索结果总结输出该功能的需求规格说明
 @app.route('/requirement_generation', methods=['POST'])
-def requirement_generation():
+async def requirement_generation():
     data = request.get_json()
     document = data.get('document')
     feature = data.get('feature')
@@ -241,13 +266,20 @@ def requirement_generation():
     prompt = llm.load_prompt("requirement_generation")
     full_prompt = prompt.format(rag_content=rag_content,
                                 document=document, feature=feature)
-    result = ''.join(llm.model_chat_flow(full_prompt))
+    result_parts = []
+    async for item in llm.model_chat_flow(full_prompt):
+        try:
+            item_data = json.loads(item.decode("utf-8").strip())
+            result_parts.append(item_data["answer"])
+        except json.JSONDecodeError:
+            pass
+    result = ''.join(result_parts)
     return jsonify({"requirement": result})
 
 
 # 4. 根据生成的需求规格，生成测试大纲
 @app.route('/outline_generation', methods=['POST'])
-def outline_generation():
+async def outline_generation():
     data = request.get_json()
     requirement = data.get('requirement')
     rag_content = data.get('rag_content', "")
@@ -257,13 +289,20 @@ def outline_generation():
     prompt = llm.load_prompt("outline_generation")
     full_prompt = prompt.format(rag_content=rag_content,
                                 requirement=requirement)
-    result = ''.join(llm.model_chat_flow(full_prompt))
+    result_parts = []
+    async for item in llm.model_chat_flow(full_prompt):
+        try:
+            item_data = json.loads(item.decode("utf-8").strip())
+            result_parts.append(item_data["answer"])
+        except json.JSONDecodeError:
+            pass
+    result = ''.join(result_parts)
     return jsonify({"outline": result})
 
 
 # 5. 根据生成的测试大纲，生成测试用例
 @app.route('/case_generation', methods=['POST'])
-def case_generation():
+async def case_generation():
     data = request.get_json()
     outline = data.get('outline')
     rag_content = data.get('rag_content', "")
@@ -273,7 +312,14 @@ def case_generation():
     prompt = llm.load_prompt("case_generation")
     full_prompt = prompt.format(rag_content=rag_content,
                                 outline=outline)
-    result = ''.join(llm.model_chat_flow(full_prompt))
+    result_parts = []
+    async for item in llm.model_chat_flow(full_prompt):
+        try:
+            item_data = json.loads(item.decode("utf-8").strip())
+            result_parts.append(item_data["answer"])
+        except json.JSONDecodeError:
+            pass
+    result = ''.join(result_parts)
     return jsonify({"test_cases": result})
 
 
@@ -288,7 +334,7 @@ def edit_prompt():
         return jsonify({"error": "Missing prompt_name or new_prompt"}), 400
     if prompt_name not in ["chat", "function_extraction", "requirement_generation", "outline_generation", "case_generation"]:
         return jsonify({"error": "Invalid prompt_name"}), 400
-    
+
     llm.update_prompt(prompt_name, new_prompt, new_dir)
     return jsonify({"message": "Prompt updated successfully"})
 
