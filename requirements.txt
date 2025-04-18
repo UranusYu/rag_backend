@@ -1,12 +1,12 @@
 --extra-index-url https://download.pytorch.org/whl/cu121    # adapt to your CUDA version
 
 flask
-langchain
-langchain-community
+langchain==0.3.23
+langchain-community==0.3.16
 sentence-transformers
 faiss-cpu
 docx2txt
 pdfminer.six
-numpy==1.24.3
-torch==2.1.0
+torch==2.5.1
+vllm==0.6.4
 gunicorn
