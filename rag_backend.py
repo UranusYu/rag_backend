@@ -1,7 +1,8 @@
 import os
 import faiss
 import numpy as np
-from flask import Flask, request, jsonify, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 from langchain_community.document_loaders import (
     TextLoader, PDFMinerLoader, Docx2txtLoader, UnstructuredExcelLoader,
     UnstructuredPowerPointLoader, UnstructuredMarkdownLoader,
@@ -18,15 +19,17 @@ import hashlib
 import asyncio
 import json
 
-app = Flask(__name__)
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+app = FastAPI()
 
 # 根据设备选择推理设备
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model_name = "BAAI/bge-large-zh-v1.5"
+retrieve_model_name = "BAAI/bge-large-zh-v1.5"
 model_kwargs = {'device': device}
 encode_kwargs = {'normalize_embeddings': True}  # set True to compute cosine similarity
 embeddings = HuggingFaceBgeEmbeddings(
-    model_name=model_name,
+    model_name=retrieve_model_name,
     cache_folder="./models",
     model_kwargs=model_kwargs,
     encode_kwargs=encode_kwargs,
@@ -120,7 +123,10 @@ def add_blocks_to_index(doc_id, blocks):
         block_id_counter += 1
         document_blocks[block_id] = (doc_id, block)
         index.add(embeddings_np[i].reshape(1, -1))
-        block_info.append((doc_id, block_id, block.page_content))
+        block_info.append({
+            "doc_id": doc_id,
+            "block_id": block_id,
+            "block_content": block.page_content})
     # 保存索引和文档块信息到本地
     faiss.write_index(index, INDEX_FILE)
     with open(DOCUMENT_BLOCKS_FILE, 'wb') as f:
@@ -138,13 +144,20 @@ def remove_blocks_from_index(doc_id):
     # 由于 Faiss 不支持直接删除，这里简单重新构建索引
     new_embeddings = []
     new_block_ids = []
+    global block_id_counter
+    block_id_counter = 0
     for block_id, (_, block) in document_blocks.items():
+        block_id = block_id_counter
+        block_id_counter += 1
         embedding = embeddings.embed_query(block.page_content)
         new_embeddings.append(embedding)
         new_block_ids.append(block_id)
     new_embeddings_np = np.array(new_embeddings).astype('float32')
+
     index.reset()
-    index.add(new_embeddings_np)
+    if new_embeddings_np.size > 0:  # 检查 new_embeddings_np 是否为空
+        index.add(new_embeddings_np)
+
     # 保存索引和文档块信息到本地
     faiss.write_index(index, INDEX_FILE)
     with open(DOCUMENT_BLOCKS_FILE, 'wb') as f:
@@ -158,196 +171,260 @@ def get_doc_id_from_url(file_url: str) -> str:
     return hashlib.sha256(file_url.encode()).hexdigest()
 
 
-@app.route('/index', methods=['POST'])
-def process_or_update():
-    file_url = request.json.get('file_url')
-    if not file_url:
-        return jsonify({"error": "Missing file_url"}), 400
+@app.post("/index")
+async def process_or_update(request: Request):
+    try:
+        data = await request.json()
+        file_url = data.get('file_url')
+        user_doc_id = data.get('doc_id')
 
-    doc_id = get_doc_id_from_url(file_url)
+        if not file_url:
+            raise HTTPException(status_code=400, detail="Missing file_url")
 
-    docs = load_document(file_url)
-    blocks = chunk_document(docs)
+        if user_doc_id:
+            doc_id = user_doc_id
+            if doc_id in set([doc_id for doc_id, _ in document_blocks.values()]):
+                remove_blocks_from_index(doc_id)
+        else:
+            doc_id = get_doc_id_from_url(file_url)
+            if doc_id in set([doc_id for doc_id, _ in document_blocks.values()]):
+                remove_blocks_from_index(doc_id)
 
-    if doc_id in set([doc_id for doc_id, _ in document_blocks.values()]):
-        remove_blocks_from_index(doc_id)
+        docs = load_document(file_url)
+        blocks = chunk_document(docs)
 
-    result = add_blocks_to_index(doc_id, blocks)
-    return jsonify({"block_info": result})
-
-
-@app.route('/query', methods=['POST'])
-def query():
-    query_text = request.json.get('query')
-    doc_ids = request.json.get('doc_ids', [])
-    topk = request.json.get('topk', 5)
-    threshold = request.json.get('threshold', 0.5)  # 余弦相似度阈值，范围 [-1, 1]
-
-    if not query_text:
-        return jsonify({"error": "Missing query"}), 400
-
-    query_embedding = np.array(embeddings.embed_query(query_text)).astype('float32').reshape(1, -1)
-    similarities, indices = index.search(query_embedding, k=min(topk, index.ntotal))
-
-    valid_results = []
-    for similarity, block_id in zip(similarities[0], indices[0]):
-        block_doc_id, block = document_blocks[block_id]
-        if (not doc_ids or block_doc_id in doc_ids) and similarity >= threshold:
-            valid_results.append({
-                "doc_id": block_doc_id,
-                "block_id": int(block_id),
-                "block_content": block.page_content,
-                "similarity": float(similarity)
-            })
-
-    if not valid_results:
-        return jsonify({"error": "No relevant documents found."}), 404
-
-    valid_results = sorted(valid_results, key=lambda x: x["similarity"], reverse=True)[:topk]
-    return jsonify({"results": valid_results})
+        result = add_blocks_to_index(doc_id, blocks)
+        return JSONResponse(content={"block_info": result})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
-# 1. 日常对话接口，返回 SSE 格式
-@app.route('/chat', methods=['POST'])
-async def chat():
-    data = request.get_json()
-    query = data.get('query')
-    rag_content = data.get('rag_content', "")
-    if not query:
-        return jsonify({"error": "Missing prompt"}), 400
+@app.post("/query")
+async def query(request: Request):
+    try:
+        data = await request.json()
+        query_text = data.get('query')
+        doc_ids = data.get('doc_ids', [])
+        topk = data.get('topk', 5)
+        threshold = data.get('threshold', 0.5)  # 余弦相似度阈值，范围 [-1, 1]
 
-    llm.history.add('user', query)
-    prompt = llm.load_prompt("chat")
-    full_prompt = prompt.format(rag_content=rag_content,
-                                query=query)
+        if not query_text:
+            raise HTTPException(status_code=400, detail="Missing query")
 
-    async def generate():
-        async for part in llm.model_chat_flow(full_prompt, is_record=True):
-            yield f"data: {part}\n\n"
+        query_embedding = np.array(embeddings.embed_query(query_text)).astype('float32').reshape(1, -1)
 
-    loop = asyncio.get_event_loop()
-    response = Response(loop.run_until_complete(generate()), mimetype='text/event-stream')
-    return response
+        # 筛选指定 doc_ids 的块
+        if doc_ids:
+            relevant_block_ids = [block_id for block_id, (doc_id, _) in document_blocks.items() if doc_id in doc_ids]
+            relevant_embeddings = np.array([embeddings.embed_query(document_blocks[block_id][1].page_content) for block_id in relevant_block_ids]).astype('float32')
+            relevant_index = faiss.IndexFlatIP(dimension)
+            relevant_index.add(relevant_embeddings)
+            similarities, indices = relevant_index.search(query_embedding, k=min(topk, relevant_index.ntotal))
+
+            valid_results = []
+            for similarity, idx in zip(similarities[0], indices[0]):
+                block_id = relevant_block_ids[idx]
+                block_doc_id, block = document_blocks[block_id]
+                if similarity >= threshold:
+                    valid_results.append({
+                        "doc_id": block_doc_id,
+                        "block_id": int(block_id),
+                        "block_content": block.page_content,
+                        "similarity": float(similarity)
+                    })
+        else:
+            similarities, indices = index.search(query_embedding, k=min(topk, index.ntotal))
+            valid_results = []
+            for similarity, block_id in zip(similarities[0], indices[0]):
+                block_doc_id, block = document_blocks[block_id]
+                if similarity >= threshold:
+                    valid_results.append({
+                        "doc_id": block_doc_id,
+                        "block_id": int(block_id),
+                        "block_content": block.page_content,
+                        "similarity": float(similarity)
+                    })
+
+        if not valid_results:
+            raise HTTPException(status_code=404, detail="No relevant documents found.")
+
+        valid_results = sorted(valid_results, key=lambda x: x["similarity"], reverse=True)[:topk]
+        return JSONResponse(content={"results": valid_results})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
 # 2. 使用大模型从需求等各类文档中自动识别出软件的功能
-@app.route('/function_extraction', methods=['POST'])
-async def function_extraction():
-    data = request.get_json()
-    document = data.get('document')
-    rag_content = data.get('rag_content', "")
-    if not document:
-        return jsonify({"error": "Missing document"}), 400
+@app.post("/function_extraction")
+async def function_extraction(request: Request):
+    try:
+        data = await request.json()
+        doc_id = data.get('doc_id')
+        if not doc_id:
+            raise HTTPException(status_code=400, detail="Missing doc_id")
 
-    prompt = llm.load_prompt("function_extraction")
-    full_prompt = prompt.format(rag_content=rag_content,
-                                document=document)
-    result_parts = []
-    async for item in llm.model_chat_flow(full_prompt):
-        try:
-            item_data = json.loads(item.decode("utf-8").strip())
-            result_parts.append(item_data["answer"])
-        except json.JSONDecodeError:
-            pass
-    result = ''.join(result_parts)
-    return jsonify({"features": result})
+        relevant_blocks = [block for _, (did, block) in document_blocks.items() if did == doc_id]
+        document = " ".join([block.page_content for block in relevant_blocks])
+
+        rag_content = data.get('rag_content', "")
+        prompt = llm.load_prompt("function_extraction")
+        examples = llm.load_examples("function_extraction")
+        full_prompt = prompt.format(rag_content=rag_content,
+                                    examples=examples,
+                                    document=document)
+        result_parts = []
+        async for item in llm.model_chat_flow(full_prompt):
+            try:
+                item_data = json.loads(item.decode("utf-8").strip())
+                result_parts.append(item_data["answer"])
+            except json.JSONDecodeError:
+                pass
+        result = ''.join(result_parts)
+        return JSONResponse(content={"features": result})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
 # 3. 从需求等文档中对功能进行检索，大模型根据检索结果总结输出该功能的需求规格说明
-@app.route('/requirement_generation', methods=['POST'])
-async def requirement_generation():
-    data = request.get_json()
-    document = data.get('document')
-    feature = data.get('feature')
-    rag_content = data.get('rag_content', "")
-    if not document or not feature:
-        return jsonify({"error": "Missing document or feature"}), 400
+@app.post("/requirement_generation")
+async def requirement_generation(request: Request):
+    try:
+        data = await request.json()
+        doc_id = data.get('doc_id')
+        feature = data.get('feature')
+        if not doc_id or not feature:
+            raise HTTPException(status_code=400, detail="Missing doc_id or feature")
 
-    prompt = llm.load_prompt("requirement_generation")
-    full_prompt = prompt.format(rag_content=rag_content,
-                                document=document, feature=feature)
-    result_parts = []
-    async for item in llm.model_chat_flow(full_prompt):
-        try:
-            item_data = json.loads(item.decode("utf-8").strip())
-            result_parts.append(item_data["answer"])
-        except json.JSONDecodeError:
-            pass
-    result = ''.join(result_parts)
-    return jsonify({"requirement": result})
+        relevant_blocks = [block for _, (did, block) in document_blocks.items() if did == doc_id]
+        document = " ".join([block.page_content for block in relevant_blocks])
+
+        rag_content = data.get('rag_content', "")
+        prompt = llm.load_prompt("requirement_generation")
+        examples = llm.load_examples("requirement_generation")
+        full_prompt = prompt.format(rag_content=rag_content,
+                                    examples=examples,
+                                    document=document, feature=feature)
+        result_parts = []
+        async for item in llm.model_chat_flow(full_prompt):
+            try:
+                item_data = json.loads(item.decode("utf-8").strip())
+                result_parts.append(item_data["answer"])
+            except json.JSONDecodeError:
+                pass
+        result = ''.join(result_parts)
+        return JSONResponse(content={"requirement": result})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
+
+
+# 1. 日常对话接口，返回 SSE 格式
+@app.post("/chat")
+async def chat(request: Request):
+    try:
+        data = await request.json()
+        query = data.get('query')
+        rag_content = data.get('rag_content', "")
+        if not query:
+            raise HTTPException(status_code=400, detail="Missing prompt")
+
+        llm.history.add('user', query)
+        prompt = llm.load_prompt("chat")
+        full_prompt = prompt.format(rag_content=rag_content,
+                                    query=query)
+
+        async def generate():
+            async for part in llm.model_chat_flow(full_prompt, is_record=True):
+                item_data = json.loads(part.decode("utf-8").strip())
+                yield f"data: {json.dumps(item_data, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(generate(), media_type='text/event-stream')
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
 # 4. 根据生成的需求规格，生成测试大纲
-@app.route('/outline_generation', methods=['POST'])
-async def outline_generation():
-    data = request.get_json()
-    requirement = data.get('requirement')
-    rag_content = data.get('rag_content', "")
-    if not requirement:
-        return jsonify({"error": "Missing requirement"}), 400
+@app.post("/outline_generation")
+async def outline_generation(request: Request):
+    try:
+        data = await request.json()
+        requirement = data.get('requirement')
+        rag_content = data.get('rag_content', "")
+        if not requirement:
+            raise HTTPException(status_code=400, detail="Missing requirement")
 
-    prompt = llm.load_prompt("outline_generation")
-    full_prompt = prompt.format(rag_content=rag_content,
-                                requirement=requirement)
-    result_parts = []
-    async for item in llm.model_chat_flow(full_prompt):
-        try:
-            item_data = json.loads(item.decode("utf-8").strip())
-            result_parts.append(item_data["answer"])
-        except json.JSONDecodeError:
-            pass
-    result = ''.join(result_parts)
-    return jsonify({"outline": result})
+        prompt = llm.load_prompt("outline_generation")
+        examples = llm.load_examples("outline_generation")
+        full_prompt = prompt.format(rag_content=rag_content,
+                                    examples=examples,
+                                    requirement=requirement)
+        result_parts = []
+        async for item in llm.model_chat_flow(full_prompt):
+            try:
+                item_data = json.loads(item.decode("utf-8").strip())
+                result_parts.append(item_data["answer"])
+            except json.JSONDecodeError:
+                pass
+        result = ''.join(result_parts)
+        return JSONResponse(content={"outline": result})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
 # 5. 根据生成的测试大纲，生成测试用例
-@app.route('/case_generation', methods=['POST'])
-async def case_generation():
-    data = request.get_json()
-    outline = data.get('outline')
-    rag_content = data.get('rag_content', "")
-    if not outline:
-        return jsonify({"error": "Missing test_outline"}), 400
+@app.post("/case_generation")
+async def case_generation(request: Request):
+    try:
+        data = await request.json()
+        outline = data.get('outline')
+        rag_content = data.get('rag_content', "")
+        if not outline:
+            raise HTTPException(status_code=400, detail="Missing test_outline")
 
-    prompt = llm.load_prompt("case_generation")
-    full_prompt = prompt.format(rag_content=rag_content,
-                                outline=outline)
-    result_parts = []
-    async for item in llm.model_chat_flow(full_prompt):
-        try:
-            item_data = json.loads(item.decode("utf-8").strip())
-            result_parts.append(item_data["answer"])
-        except json.JSONDecodeError:
-            pass
-    result = ''.join(result_parts)
-    return jsonify({"test_cases": result})
+        prompt = llm.load_prompt("case_generation")
+        examples = llm.load_examples("case_generation")
+        full_prompt = prompt.format(rag_content=rag_content,
+                                    examples=examples,
+                                    outline=outline)
+        result_parts = []
+        async for item in llm.model_chat_flow(full_prompt):
+            try:
+                item_data = json.loads(item.decode("utf-8").strip())
+                result_parts.append(item_data["answer"])
+            except json.JSONDecodeError:
+                pass
+        result = ''.join(result_parts)
+        return JSONResponse(content={"test_cases": result})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
 # 用户编辑 prompt
-@app.route('/edit_prompt', methods=['POST'])
-def edit_prompt():
-    data = request.get_json()
-    prompt_name = data.get('prompt_name')
-    new_prompt = data.get('new_prompt')
-    new_dir = data.get('new_dir')
-    if not prompt_name or not new_prompt:
-        return jsonify({"error": "Missing prompt_name or new_prompt"}), 400
-    if prompt_name not in ["chat", "function_extraction", "requirement_generation", "outline_generation", "case_generation"]:
-        return jsonify({"error": "Invalid prompt_name"}), 400
+@app.post("/edit_prompt")
+async def edit_prompt(request: Request):
+    try:
+        data = await request.json()
+        prompt_name = data.get('prompt_name')
+        new_prompt = data.get('new_prompt')
+        new_dir = data.get('new_dir')
+        if not prompt_name or not new_prompt:
+            raise HTTPException(status_code=400, detail="Missing prompt_name or new_prompt")
+        if prompt_name not in ["chat", "function_extraction", "requirement_generation", "outline_generation", "case_generation"]:
+            raise HTTPException(status_code=400, detail="Invalid prompt_name")
 
-    llm.update_prompt(prompt_name, new_prompt, new_dir)
-    return jsonify({"message": "Prompt updated successfully"})
-
-
-@app.route('/update_model_config', methods=['POST'])
-def update_model_config():
-    data = request.get_json()
-    model_name = data.get('model_name')
-    base_url = data.get('base_url')
-    api_token = data.get('api_token')
-    llm.update_model_config(model_name, base_url, api_token)
-    return jsonify({"message": "Config updated successfully"})
+        llm.update_prompt(prompt_name, new_prompt, new_dir)
+        return JSONResponse(content={"message": "Prompt updated successfully"})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
-if __name__ == '__main__':
-    app.run(debug=True)
+@app.post("/update_model_config")
+async def update_model_config(request: Request):
+    try:
+        data = await request.json()
+        model_name = data.get('model_name')
+        base_url = data.get('base_url')
+        api_token = data.get('api_token')
+        llm.update_model_config(model_name, base_url, api_token)
+        return JSONResponse(content={"message": "Config updated successfully"})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")

@@ -42,6 +42,15 @@ class LLM:
         self.client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_token)
         self.tokenizer = AutoTokenizer.from_pretrained("models/outline-generation-distill-v3")
         self.prompt_dir = "prompts/default"
+        self.example_dir = "examples"
+
+
+    def load_examples(self, prompt_name: str) -> str:
+        example_path = os.path.join(self.example_dir, f"{prompt_name}.txt")
+        if os.path.exists(example_path):
+            with open(example_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        return ""
 
     def load_prompt(self, prompt_name: str) -> str:
         prompt_path = os.path.join(self.prompt_dir, f"{prompt_name}.txt")
@@ -58,7 +67,7 @@ class LLM:
         with open(prompt_path, 'w', encoding='utf-8') as f:
             f.write(new_prompt)
 
-    def trucate_history(self, messages: List[Dict[str, str]], max_length: int) -> (int, List[Dict[str, str]]):
+    def trucate_history(self, messages: List[Dict[str, str]], max_length: int) -> tuple[int, List[Dict[str, str]]]:
         total_token_count_in = self.count_tokens(messages)
         while total_token_count_in > max_length:
             print("Warning: 超出最大长度, 截断对话历史！！！")
@@ -99,7 +108,7 @@ class LLM:
                 if content:
                     full_llm_answer += content
                     total_token_count_out += 1
-                    yield f'{json.dumps({"query": prompt, "answer": content})}\n\n'.encode("utf-8")
+                    yield f'{json.dumps({"answer": content})}\n\n'.encode("utf-8")
             print(f"\n Usage: 输入Token{total_token_count_in}, 输出Token{total_token_count_out}")
             if is_record:
                 self.history.add('assistant', full_llm_answer)
