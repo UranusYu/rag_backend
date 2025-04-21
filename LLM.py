@@ -3,30 +3,7 @@ from openai import AsyncOpenAI, OpenAIError
 import tiktoken
 import os
 from transformers import AutoTokenizer
-from typing import List, Dict  # 新增类型提示相关导入
-
-
-class History:
-    def __init__(self, max_length: int = 10):
-        self.messages: List[Dict[str, str]] = []
-        self.current_length: int = 0
-        self.max_length: int = max_length
-
-    def add(self, role: str, content: str):
-        if self.current_length >= self.max_length:
-            self.messages.pop(0)
-        self.messages.append({'role': role, 'content': content})
-        self.current_length += 1
-
-    def clear(self):
-        self.messages = []
-        self.current_length = 0
-
-    def get_history(self) -> List[Dict[str, str]]:
-        return self.messages
-
-    def get_length(self) -> int:
-        return self.current_length
+from typing import List, Dict
 
 
 class LLM:
@@ -34,7 +11,6 @@ class LLM:
                  api_token: str = "token-abc123",
                  base_url: str = "http://0.0.0.0:7789/v1"):
         print("初始化LLM")
-        self.history = History()
         self.model_name = model_name
         self.api_token = api_token
         self.base_url = base_url
@@ -43,7 +19,6 @@ class LLM:
         self.tokenizer = AutoTokenizer.from_pretrained("models/outline-generation-distill-v3")
         self.prompt_dir = "prompts/default"
         self.example_dir = "examples"
-
 
     def load_examples(self, prompt_name: str) -> str:
         example_path = os.path.join(self.example_dir, f"{prompt_name}.txt")
@@ -69,11 +44,10 @@ class LLM:
 
     def trucate_history(self, messages: List[Dict[str, str]], max_length: int) -> tuple[int, List[Dict[str, str]]]:
         total_token_count_in = self.count_tokens(messages)
-        while total_token_count_in > max_length:
+        while total_token_count_in > max_length and messages:  # 修改判断条件，避免空列表
             print("Warning: 超出最大长度, 截断对话历史！！！")
             messages.pop(0)
             total_token_count_in = self.count_tokens(messages)
-        self.history.messages = messages
         return total_token_count_in, messages
 
     def count_tokens(self, messages: List[Dict[str, str]]) -> int:
@@ -82,12 +56,16 @@ class LLM:
             total_token_count += len(self.tokenizer.encode(mess['content']))
         return total_token_count
 
-    async def model_chat_flow(self, prompt: str, is_record: bool = False):
-        messages = self.history.get_history()
-        if is_record:
-            messages[-1]["content"] = prompt
-        else:
-            messages += [{'role': 'user', 'content': prompt}]
+    async def model_chat_flow(self, messages: List[Dict[str, str]], model_name=None, base_url=None, api_token=None):
+        if model_name:
+            self.model_name = model_name
+        if base_url and base_url != self.base_url:
+            self.base_url = base_url
+            self.client = AsyncOpenAI(base_url=self.base_url, api_key=api_token or self.api_token)
+        if api_token and api_token != self.api_token:
+            self.api_token = api_token
+            self.client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_token)
+
         try:
             # 保证输入不超过最大值
             total_token_count_in, messages = self.trucate_history(messages, self.max_model_tokens)
@@ -110,18 +88,6 @@ class LLM:
                     total_token_count_out += 1
                     yield f'{json.dumps({"answer": content})}\n\n'.encode("utf-8")
             print(f"\n Usage: 输入Token{total_token_count_in}, 输出Token{total_token_count_out}")
-            if is_record:
-                self.history.add('assistant', full_llm_answer)
 
         except OpenAIError as e:
-            yield str(e)  # 修改为获取更完整的错误信息
-
-    def update_model_config(self, model_name: str = None, base_url: str = None, api_token: str = None):
-        if model_name:
-            self.model_name = model_name
-        if base_url:
-            self.base_url = base_url
-            self.client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_token)
-        if api_token:
-            self.api_token = api_token
-            self.client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_token)
+            yield str(e).encode("utf-8")  # 修改为获取更完整的错误信息

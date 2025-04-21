@@ -7,7 +7,8 @@ from langchain_community.document_loaders import (
     TextLoader, PDFMinerLoader, Docx2txtLoader, UnstructuredExcelLoader,
     UnstructuredPowerPointLoader, UnstructuredMarkdownLoader,
     UnstructuredHTMLLoader, UnstructuredODTLoader,
-    UnstructuredEmailLoader, UnstructuredCSVLoader
+    UnstructuredEmailLoader, UnstructuredCSVLoader,
+    UnstructuredURLLoader
 )
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
@@ -18,7 +19,6 @@ import pickle
 import hashlib
 import asyncio
 import json
-
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 app = FastAPI()
@@ -64,6 +64,10 @@ def load_document(file_url: str):
     """
     根据文件扩展名加载文档
     """
+    if file_url.startswith('http://') or file_url.startswith('https://'):
+        loader = UnstructuredURLLoader(urls=[file_url])
+        return loader.load()
+
     if file_url.endswith('.txt'):
         loader = TextLoader(file_url)
     elif file_url.endswith('.pdf'):
@@ -96,7 +100,7 @@ def chunk_document(docs):
     """
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=512,
-        chunk_overlap=32,
+        chunk_overlap=0,
         separators=["\n\n", "\n", " ", ""]
     )
     return text_splitter.split_documents(docs)
@@ -199,6 +203,20 @@ async def process_or_update(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
+@app.post("/delete_index")  # 新增接口
+async def delete_index(request: Request):
+    try:
+        data = await request.json()
+        doc_id = data.get('doc_id')
+        if not doc_id:
+            raise HTTPException(status_code=400, detail="Missing doc_id")
+
+        remove_blocks_from_index(doc_id)
+        return JSONResponse(content={"message": "Index deleted successfully"})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
+
+
 @app.post("/query")
 async def query(request: Request):
     try:
@@ -259,11 +277,12 @@ async def query(request: Request):
 async def function_extraction(request: Request):
     try:
         data = await request.json()
-        doc_id = data.get('doc_id')
-        if not doc_id:
-            raise HTTPException(status_code=400, detail="Missing doc_id")
+        doc_ids = data.get('doc_ids')
+        messages = data.get('messages', [])
+        if not doc_ids:
+            raise HTTPException(status_code=400, detail="Missing doc_ids")
 
-        relevant_blocks = [block for _, (did, block) in document_blocks.items() if did == doc_id]
+        relevant_blocks = [block for _, (did, block) in document_blocks.items() if did in doc_ids]
         document = " ".join([block.page_content for block in relevant_blocks])
 
         rag_content = data.get('rag_content', "")
@@ -272,8 +291,9 @@ async def function_extraction(request: Request):
         full_prompt = prompt.format(rag_content=rag_content,
                                     examples=examples,
                                     document=document)
+
         result_parts = []
-        async for item in llm.model_chat_flow(full_prompt):
+        async for item in llm.model_chat_flow(messages + [{"role": "user", "content": full_prompt}]):
             try:
                 item_data = json.loads(item.decode("utf-8").strip())
                 result_parts.append(item_data["answer"])
@@ -290,12 +310,13 @@ async def function_extraction(request: Request):
 async def requirement_generation(request: Request):
     try:
         data = await request.json()
-        doc_id = data.get('doc_id')
+        doc_ids = data.get('doc_ids')
         feature = data.get('feature')
-        if not doc_id or not feature:
-            raise HTTPException(status_code=400, detail="Missing doc_id or feature")
+        messages = data.get('messages', [])
+        if not doc_ids or not feature:
+            raise HTTPException(status_code=400, detail="Missing doc_ids or feature")
 
-        relevant_blocks = [block for _, (did, block) in document_blocks.items() if did == doc_id]
+        relevant_blocks = [block for _, (did, block) in document_blocks.items() if did in doc_ids]
         document = " ".join([block.page_content for block in relevant_blocks])
 
         rag_content = data.get('rag_content', "")
@@ -304,8 +325,9 @@ async def requirement_generation(request: Request):
         full_prompt = prompt.format(rag_content=rag_content,
                                     examples=examples,
                                     document=document, feature=feature)
+
         result_parts = []
-        async for item in llm.model_chat_flow(full_prompt):
+        async for item in llm.model_chat_flow(messages + [{"role": "user", "content": full_prompt}]):
             try:
                 item_data = json.loads(item.decode("utf-8").strip())
                 result_parts.append(item_data["answer"])
@@ -322,18 +344,23 @@ async def requirement_generation(request: Request):
 async def chat(request: Request):
     try:
         data = await request.json()
-        query = data.get('query')
+        messages = data.get('messages', [])
         rag_content = data.get('rag_content', "")
-        if not query:
-            raise HTTPException(status_code=400, detail="Missing prompt")
+        model_name = data.get('model_name')
+        base_url = data.get('base_url')
+        api_token = data.get('api_token')
+        if not messages:
+            raise HTTPException(status_code=400, detail="Missing messages")
 
-        llm.history.add('user', query)
+        query = messages[-1]['content']
         prompt = llm.load_prompt("chat")
         full_prompt = prompt.format(rag_content=rag_content,
                                     query=query)
 
+        new_messages = messages[:-1] + [{"role": "user", "content": full_prompt}]
+
         async def generate():
-            async for part in llm.model_chat_flow(full_prompt, is_record=True):
+            async for part in llm.model_chat_flow(new_messages, model_name=model_name, base_url=base_url, api_token=api_token):
                 item_data = json.loads(part.decode("utf-8").strip())
                 yield f"data: {json.dumps(item_data, ensure_ascii=False)}\n\n"
 
@@ -349,6 +376,7 @@ async def outline_generation(request: Request):
         data = await request.json()
         requirement = data.get('requirement')
         rag_content = data.get('rag_content', "")
+        messages = data.get('messages', [])
         if not requirement:
             raise HTTPException(status_code=400, detail="Missing requirement")
 
@@ -357,8 +385,9 @@ async def outline_generation(request: Request):
         full_prompt = prompt.format(rag_content=rag_content,
                                     examples=examples,
                                     requirement=requirement)
+
         result_parts = []
-        async for item in llm.model_chat_flow(full_prompt):
+        async for item in llm.model_chat_flow(messages + [{"role": "user", "content": full_prompt}]):
             try:
                 item_data = json.loads(item.decode("utf-8").strip())
                 result_parts.append(item_data["answer"])
@@ -377,6 +406,7 @@ async def case_generation(request: Request):
         data = await request.json()
         outline = data.get('outline')
         rag_content = data.get('rag_content', "")
+        messages = data.get('messages', [])
         if not outline:
             raise HTTPException(status_code=400, detail="Missing test_outline")
 
@@ -385,8 +415,9 @@ async def case_generation(request: Request):
         full_prompt = prompt.format(rag_content=rag_content,
                                     examples=examples,
                                     outline=outline)
+
         result_parts = []
-        async for item in llm.model_chat_flow(full_prompt):
+        async for item in llm.model_chat_flow(messages + [{"role": "user", "content": full_prompt}]):
             try:
                 item_data = json.loads(item.decode("utf-8").strip())
                 result_parts.append(item_data["answer"])
@@ -413,18 +444,5 @@ async def edit_prompt(request: Request):
 
         llm.update_prompt(prompt_name, new_prompt, new_dir)
         return JSONResponse(content={"message": "Prompt updated successfully"})
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON data")
-
-
-@app.post("/update_model_config")
-async def update_model_config(request: Request):
-    try:
-        data = await request.json()
-        model_name = data.get('model_name')
-        base_url = data.get('base_url')
-        api_token = data.get('api_token')
-        llm.update_model_config(model_name, base_url, api_token)
-        return JSONResponse(content={"message": "Config updated successfully"})
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON data")
