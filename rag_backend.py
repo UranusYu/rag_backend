@@ -45,6 +45,8 @@ dimension = 1024
 index = faiss.IndexFlatIP(dimension)
 document_blocks = {}
 block_id_counter = 0
+# 新增：顺序索引到block_id的映射
+index_to_block_id = {}
 
 # 本地存储路径
 INDEX_FILE = "index/index.faiss"
@@ -56,6 +58,8 @@ if os.path.exists(INDEX_FILE) and os.path.exists(DOCUMENT_BLOCKS_FILE):
     with open(DOCUMENT_BLOCKS_FILE, 'rb') as f:
         document_blocks = pickle.load(f)
     block_id_counter = max(document_blocks.keys()) + 1 if document_blocks else 0
+    # 新增：从已加载的document_blocks重建index_to_block_id映射
+    index_to_block_id = {i: block_id for i, block_id in enumerate(document_blocks.keys())}
 
 llm = LLM()
 
@@ -65,7 +69,29 @@ def load_document(file_url: str):
     根据文件扩展名加载文档
     """
     if file_url.startswith('http://') or file_url.startswith('https://'):
-        loader = UnstructuredURLLoader(urls=[file_url])
+        # 优先根据后缀选择加载器
+        if file_url.endswith('.txt'):
+            loader = TextLoader(file_url)
+        elif file_url.endswith('.pdf'):
+            loader = PDFMinerLoader(file_url)
+        elif file_url.endswith('.docx'):
+            loader = Docx2txtLoader(file_url)
+        elif file_url.endswith('.xlsx') or file_url.endswith('.xls'):
+            loader = UnstructuredExcelLoader(file_url)
+        elif file_url.endswith('.pptx'):
+            loader = UnstructuredPowerPointLoader(file_url)
+        elif file_url.endswith('.md'):
+            loader = UnstructuredMarkdownLoader(file_url)
+        elif file_url.endswith('.html'):
+            loader = UnstructuredHTMLLoader(file_url)
+        elif file_url.endswith('.odt'):
+            loader = UnstructuredODTLoader(file_url)
+        elif file_url.endswith('.eml'):
+            loader = UnstructuredEmailLoader(file_url)
+        elif file_url.endswith('.csv'):
+            loader = UnstructuredCSVLoader(file_url)
+        else:
+            loader = UnstructuredURLLoader(urls=[file_url])
         return loader.load()
 
     if file_url.endswith('.txt'):
@@ -127,6 +153,8 @@ def add_blocks_to_index(doc_id, blocks):
         block_id_counter += 1
         document_blocks[block_id] = (doc_id, block)
         index.add(embeddings_np[i].reshape(1, -1))
+        # 新增：更新顺序索引到block_id的映射
+        index_to_block_id[len(index_to_block_id)] = block_id
         block_info.append({
             "doc_id": doc_id,
             "block_id": block_id,
@@ -145,6 +173,8 @@ def remove_blocks_from_index(doc_id):
     old_block_ids = [block_id for block_id, (doc_id_, _) in document_blocks.items() if doc_id_ == doc_id]
     for block_id in old_block_ids:
         del document_blocks[block_id]
+        # 新增：从映射中移除对应的顺序索引
+        index_to_block_id = {i: bid for i, bid in index_to_block_id.items() if bid != block_id}
     # 由于 Faiss 不支持直接删除，这里简单重新构建索引
     new_embeddings = []
     new_block_ids = []
@@ -231,8 +261,14 @@ async def query(request: Request):
 
         query_embedding = np.array(embeddings.embed_query(query_text)).astype('float32').reshape(1, -1)
 
-        # 筛选指定 doc_ids 的块
+        # 筛选指定doc_ids的块
         if doc_ids:
+            # 检查是否存在有效的doc_id
+            valid_doc_ids = set([doc_id for doc_id, _ in document_blocks.values()])
+            missing_doc_ids = [doc_id for doc_id in doc_ids if doc_id not in valid_doc_ids]
+            if missing_doc_ids:
+                raise HTTPException(status_code=404, detail=f"Some doc_ids not found: {', '.join(map(str, missing_doc_ids))}")
+
             relevant_block_ids = [block_id for block_id, (doc_id, _) in document_blocks.items() if doc_id in doc_ids]
             relevant_embeddings = np.array([embeddings.embed_query(document_blocks[block_id][1].page_content) for block_id in relevant_block_ids]).astype('float32')
             relevant_index = faiss.IndexFlatIP(dimension)
@@ -253,15 +289,18 @@ async def query(request: Request):
         else:
             similarities, indices = index.search(query_embedding, k=min(topk, index.ntotal))
             valid_results = []
-            for similarity, block_id in zip(similarities[0], indices[0]):
-                block_doc_id, block = document_blocks[block_id]
-                if similarity >= threshold:
-                    valid_results.append({
-                        "doc_id": block_doc_id,
-                        "block_id": int(block_id),
-                        "block_content": block.page_content,
-                        "similarity": float(similarity)
-                    })
+            for similarity, idx in zip(similarities[0], indices[0]):
+                # 新增：通过顺序索引获取实际的block_id
+                block_id = index_to_block_id.get(idx)
+                if block_id is not None:
+                    block_doc_id, block = document_blocks[block_id]
+                    if similarity >= threshold:
+                        valid_results.append({
+                            "doc_id": block_doc_id,
+                            "block_id": int(block_id),
+                            "block_content": block.page_content,
+                            "similarity": float(similarity)
+                        })
 
         if not valid_results:
             raise HTTPException(status_code=404, detail="No relevant documents found.")
@@ -361,8 +400,11 @@ async def chat(request: Request):
 
         async def generate():
             async for part in llm.model_chat_flow(new_messages, model_name=model_name, base_url=base_url, api_token=api_token):
-                item_data = json.loads(part.decode("utf-8").strip())
-                yield f"data: {json.dumps(item_data, ensure_ascii=False)}\n\n"
+                try:
+                    item_data = json.loads(part.decode("utf-8").strip())
+                    yield f"data: {json.dumps(item_data, ensure_ascii=False)}\n\n"
+                except json.JSONDecodeError:
+                    pass
 
         return StreamingResponse(generate(), media_type='text/event-stream')
     except json.JSONDecodeError:

@@ -15,7 +15,6 @@ class LLM:
         self.api_token = api_token
         self.base_url = base_url
         self.max_model_tokens = 16384
-        self.client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_token)
         self.tokenizer = AutoTokenizer.from_pretrained("models/outline-generation-distill-v3")
         self.prompt_dir = "prompts/default"
         self.example_dir = "examples"
@@ -57,24 +56,24 @@ class LLM:
         return total_token_count
 
     async def model_chat_flow(self, messages: List[Dict[str, str]], model_name=None, base_url=None, api_token=None):
-        if model_name:
-            self.model_name = model_name
-        if base_url and base_url != self.base_url:
-            self.base_url = base_url
-            self.client = AsyncOpenAI(base_url=self.base_url, api_key=api_token or self.api_token)
-        if api_token and api_token != self.api_token:
-            self.api_token = api_token
-            self.client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_token)
+        if not model_name:
+            model_name = self.model_name
+        if not base_url:
+            base_url = self.base_url
+        if not api_token:
+            api_token = self.api_token
+        
+        client = AsyncOpenAI(base_url=base_url, api_key=api_token)
 
         try:
             # 保证输入不超过最大值
             total_token_count_in, messages = self.trucate_history(messages, self.max_model_tokens)
 
             # 调用 OpenAI 流式 API
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
+            response = await client.chat.completions.create(
+                model=model_name,
                 messages=messages,
-                temperature=0.3,
+                temperature=0.4,
                 stream=True,
                 max_tokens=self.max_model_tokens
             )
