@@ -1,4 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu121    # adapt to your CUDA version
+--extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 flask
 langchain==0.3.23
@@ -10,4 +11,5 @@ pdfminer.six
 torch==2.5.1
 vllm==0.6.4
 gunicorn
-unstructured
+unstructured[local-inference]
+layoutparser[layoutmodels,tesseract]

@@ -73,7 +73,7 @@ class LLM:
             response = await client.chat.completions.create(
                 model=model_name,
                 messages=messages,
-                temperature=0.4,
+                temperature=0.2,
                 stream=True,
                 max_tokens=self.max_model_tokens
             )

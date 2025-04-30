@@ -2,14 +2,9 @@ import os
 import faiss
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response, JSONResponse, StreamingResponse
-from langchain_community.document_loaders import (
-    TextLoader, PDFMinerLoader, Docx2txtLoader, UnstructuredExcelLoader,
-    UnstructuredPowerPointLoader, UnstructuredMarkdownLoader,
-    UnstructuredHTMLLoader, UnstructuredODTLoader,
-    UnstructuredEmailLoader, UnstructuredCSVLoader,
-    UnstructuredURLLoader
-)
+from fastapi.responses import JSONResponse, StreamingResponse
+import requests
+from langchain_community.document_loaders import UnstructuredFileLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 
@@ -20,6 +15,11 @@ import hashlib
 import asyncio
 import json
 
+import ssl
+import re
+
+
+ssl._create_default_https_context = ssl._create_unverified_context
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 app = FastAPI()
 
@@ -64,60 +64,74 @@ if os.path.exists(INDEX_FILE) and os.path.exists(DOCUMENT_BLOCKS_FILE):
 llm = LLM()
 
 
+def get_load(file_url: str):
+    return UnstructuredFileLoader(file_url, mode="single")
+
+
 def load_document(file_url: str):
     """
-    根据文件扩展名加载文档
+    根据文件路径或URL加载文档
     """
     if file_url.startswith('http://') or file_url.startswith('https://'):
-        # 优先根据后缀选择加载器
-        if file_url.endswith('.txt'):
-            loader = TextLoader(file_url)
-        elif file_url.endswith('.pdf'):
-            loader = PDFMinerLoader(file_url)
-        elif file_url.endswith('.docx'):
-            loader = Docx2txtLoader(file_url)
-        elif file_url.endswith('.xlsx') or file_url.endswith('.xls'):
-            loader = UnstructuredExcelLoader(file_url)
-        elif file_url.endswith('.pptx'):
-            loader = UnstructuredPowerPointLoader(file_url)
-        elif file_url.endswith('.md'):
-            loader = UnstructuredMarkdownLoader(file_url)
-        elif file_url.endswith('.html'):
-            loader = UnstructuredHTMLLoader(file_url)
-        elif file_url.endswith('.odt'):
-            loader = UnstructuredODTLoader(file_url)
-        elif file_url.endswith('.eml'):
-            loader = UnstructuredEmailLoader(file_url)
-        elif file_url.endswith('.csv'):
-            loader = UnstructuredCSVLoader(file_url)
-        else:
-            loader = UnstructuredURLLoader(urls=[file_url])
-        return loader.load()
+        try:
+            # 发送HEAD请求获取文件大小
+            head_response = requests.head(file_url)
+            head_response.raise_for_status()
+            total_size = int(head_response.headers.get('content-length', 0))
 
-    if file_url.endswith('.txt'):
-        loader = TextLoader(file_url)
-    elif file_url.endswith('.pdf'):
-        loader = PDFMinerLoader(file_url)
-    elif file_url.endswith('.docx'):
-        loader = Docx2txtLoader(file_url)
-    elif file_url.endswith('.xlsx') or file_url.endswith('.xls'):
-        loader = UnstructuredExcelLoader(file_url)
-    elif file_url.endswith('.pptx'):
-        loader = UnstructuredPowerPointLoader(file_url)
-    elif file_url.endswith('.md'):
-        loader = UnstructuredMarkdownLoader(file_url)
-    elif file_url.endswith('.html'):
-        loader = UnstructuredHTMLLoader(file_url)
-    elif file_url.endswith('.odt'):
-        loader = UnstructuredODTLoader(file_url)
-    elif file_url.endswith('.eml'):
-        loader = UnstructuredEmailLoader(file_url)
-    elif file_url.endswith('.csv'):
-        loader = UnstructuredCSVLoader(file_url)
+            # 发送GET请求获取文件内容
+            response = requests.get(file_url, stream=True)
+            response.raise_for_status()
+
+            # 尝试从响应头中获取文件名
+            file_name = None
+            content_disposition = response.headers.get('content-disposition')
+            if content_disposition:
+                for part in content_disposition.split(';'):
+                    part = part.strip()
+                    if part.startswith('filename='):
+                        file_name = part.split('=')[1].strip('"')
+                        break
+
+            # 如果响应头中没有文件名，根据URL生成文件名
+            if not file_name:
+                file_name = os.path.basename(file_url)
+
+            # 确保文件名在当前目录下不重复
+            counter = 1
+            original_name, extension = os.path.splitext(file_name)
+            while os.path.exists(file_name):
+                file_name = f"{original_name}_{counter}{extension}"
+                counter += 1
+
+            # 下载文件
+            with open(file_name, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            # 使用 UnstructuredFileLoader 加载文件
+            # loader = UnstructuredFileLoader(file_name)
+            loader = get_load(file_name)
+            docs = loader.load()
+
+            # 删除下载的文件（如果需要）
+            os.remove(file_name)
+
+            return docs
+
+        except requests.RequestException as e:
+            return []
+        except Exception as e:
+            return []
     else:
-        # 假设是代码文件，以文本方式加载
-        loader = TextLoader(file_url)
-    return loader.load()
+        try:
+            # 对于本地文件，直接使用 UnstructuredFileLoader 加载
+            # loader = UnstructuredFileLoader(file_url)
+            loader = get_load(file_url)
+            return loader.load()
+        except Exception as e:
+            return []
 
 
 def chunk_document(docs):
@@ -144,7 +158,7 @@ def add_blocks_to_index(doc_id, blocks):
     """
     将文本块添加到索引中，并保存索引和文档块信息
     """
-    global block_id_counter
+    global block_id_counter, index_to_block_id
     embeddings_list = calculate_embeddings(blocks)
     embeddings_np = np.array(embeddings_list).astype('float32')
     block_info = []
@@ -170,27 +184,33 @@ def remove_blocks_from_index(doc_id):
     """
     从索引中移除指定文档的文本块，并重新构建索引
     """
+    global index_to_block_id, document_blocks
+    # 找出需要移除的块的ID
     old_block_ids = [block_id for block_id, (doc_id_, _) in document_blocks.items() if doc_id_ == doc_id]
+    # 找出需要保留的块的ID
+    keep_block_ids = [block_id for block_id in document_blocks if block_id not in old_block_ids]
+
+    # 移除不需要的块
     for block_id in old_block_ids:
         del document_blocks[block_id]
-        # 新增：从映射中移除对应的顺序索引
-        index_to_block_id = {i: bid for i, bid in index_to_block_id.items() if bid != block_id}
-    # 由于 Faiss 不支持直接删除，这里简单重新构建索引
-    new_embeddings = []
-    new_block_ids = []
-    global block_id_counter
-    block_id_counter = 0
-    for block_id, (_, block) in document_blocks.items():
-        block_id = block_id_counter
-        block_id_counter += 1
-        embedding = embeddings.embed_query(block.page_content)
-        new_embeddings.append(embedding)
-        new_block_ids.append(block_id)
-    new_embeddings_np = np.array(new_embeddings).astype('float32')
 
+    # 重新构建 index_to_block_id 映射
+    index_to_block_id = {i: block_id for i, block_id in enumerate(keep_block_ids)}
+
+    # 提取保留块的嵌入向量
+    keep_embeddings = []
+    for block_id in keep_block_ids:
+        # 假设之前已经有一个函数可以根据 block_id 获取嵌入向量
+        # 这里简单模拟，实际需要根据你的代码逻辑修改
+        embedding = index.reconstruct(int(np.where(np.array(list(index_to_block_id.values())) == block_id)[0]))
+        keep_embeddings.append(embedding)
+
+    keep_embeddings_np = np.array(keep_embeddings).astype('float32')
+
+    # 重置索引并添加保留的嵌入向量
     index.reset()
-    if new_embeddings_np.size > 0:  # 检查 new_embeddings_np 是否为空
-        index.add(new_embeddings_np)
+    if keep_embeddings_np.size > 0:
+        index.add(keep_embeddings_np)
 
     # 保存索引和文档块信息到本地
     faiss.write_index(index, INDEX_FILE)
@@ -225,6 +245,8 @@ async def process_or_update(request: Request):
                 remove_blocks_from_index(doc_id)
 
         docs = load_document(file_url)
+        if not docs:
+            raise HTTPException(status_code=400, detail="Failed to load document from the provided URL.")
         blocks = chunk_document(docs)
 
         result = add_blocks_to_index(doc_id, blocks)
@@ -311,7 +333,6 @@ async def query(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
-# 2. 使用大模型从需求等各类文档中自动识别出软件的功能
 @app.post("/function_extraction")
 async def function_extraction(request: Request):
     try:
@@ -339,12 +360,22 @@ async def function_extraction(request: Request):
             except json.JSONDecodeError:
                 pass
         result = ''.join(result_parts)
-        return JSONResponse(content={"features": result})
+
+        # 直接将包含 <think> 的 result 赋值给 answer
+        answer = result
+
+        # 按照要求分割功能
+        function_sections = result.strip().split("\n\n")
+        features = []
+        for section in function_sections:
+            if section[0].isdigit():
+                features.append(section.strip())
+
+        return JSONResponse(content={"answer": answer, "features": features})
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
-# 3. 从需求等文档中对功能进行检索，大模型根据检索结果总结输出该功能的需求规格说明
 @app.post("/requirement_generation")
 async def requirement_generation(request: Request):
     try:
@@ -373,7 +404,43 @@ async def requirement_generation(request: Request):
             except json.JSONDecodeError:
                 pass
         result = ''.join(result_parts)
-        return JSONResponse(content={"requirement": result})
+
+        # 直接将 result 赋值给 answer
+        answer = result
+
+        match = re.search(r'</think>(.*)', result, re.DOTALL)
+        result = match.group(1) if match else result
+
+        # 提取结构化信息
+        requirement = {}
+
+        # 提取测试项名称
+        test_item_name_match = re.search(r"#### 用例名称\n(.*?)\n\n", result, re.DOTALL)
+        requirement["用例名称"] = test_item_name_match.group(1).strip() if test_item_name_match else "无"
+
+        # 提取需求描述
+        requirement_description_match = re.search(r"#### 简要描述\n(.*?)\n\n", result, re.DOTALL)
+        requirement["简要描述"] = requirement_description_match.group(1).strip() if requirement_description_match else "无"
+
+        partner_match = re.search(r"#### 参与者\n(.*?)\n\n", result, re.DOTALL)
+        requirement["参与者"] = partner_match.group(1).strip() if partner_match else "无"
+
+        pre_req_match = re.search(r"#### 前置条件\n(.*?)\n\n", result, re.DOTALL)
+        requirement["前置条件"] = pre_req_match.group(1).strip() if pre_req_match else "无"
+
+        main_proc_match = re.search(r"#### 主流程\n(.*?)\n\n", result, re.DOTALL)
+        requirement["主流程"] = main_proc_match.group(1).strip() if main_proc_match else "无"
+
+        expand_proc_match = re.search(r"#### 扩展流程\n(.*?)\n\n", result, re.DOTALL)
+        requirement["扩展流程"] = expand_proc_match.group(1).strip() if expand_proc_match else "无"
+
+        post_proc_match = re.search(r"#### 后置条件\n(.*?)\n\n", result, re.DOTALL)
+        requirement["后置条件"] = post_proc_match.group(1).strip() if post_proc_match else "无"
+
+        rule_match = re.search(r"#### 规则与约束\n(.*)", result, re.DOTALL)
+        requirement["规则与约束"] = rule_match.group(1).strip() if rule_match else "无"
+
+        return JSONResponse(content={"answer": answer, "requirement": requirement})
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON data")
 
@@ -436,7 +503,33 @@ async def outline_generation(request: Request):
             except json.JSONDecodeError:
                 pass
         result = ''.join(result_parts)
-        return JSONResponse(content={"outline": result})
+
+        # 直接将 result 赋值给 answer
+        answer = result
+
+        match = re.search(r'</think>(.*)', result, re.DOTALL)
+        result = match.group(1) if match else result
+
+        # 提取结构化信息
+        outline_structure = {}
+        # 提取测试项名称
+        test_item_name_match = re.search(r"#### 测试项名称\n(.*?)\n\n", result, re.DOTALL)
+        outline_structure["测试项名称"] = test_item_name_match.group(1).strip() if test_item_name_match else "无"
+
+        # 提取需求描述
+        requirement_description_match = re.search(r"#### 需求描述\n(.*?)\n\n", result, re.DOTALL)
+        outline_structure["需求描述"] = requirement_description_match.group(1).strip() if requirement_description_match else "无"
+
+        test_method_match = re.search(r"#### 测试方法\n(.*?)\n\n", result, re.DOTALL)
+        outline_structure["测试方法"] = test_method_match.group(1).strip() if test_method_match else "无"
+
+        normal_case_match = re.search(r"#### 测试充分性\n(.*?)\n\n", result, re.DOTALL)
+        outline_structure["测试充分性"] = normal_case_match.group(1).strip() if normal_case_match else "无"
+
+        normal_criterion_match = re.search(r"#### 通过准则\n(.*)", result, re.DOTALL)
+        outline_structure["通过准则"] = normal_criterion_match.group(1).strip() if normal_criterion_match else "无"
+
+        return JSONResponse(content={"answer": answer, "outline": outline_structure})
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON data")
 
@@ -466,7 +559,57 @@ async def case_generation(request: Request):
             except json.JSONDecodeError:
                 pass
         result = ''.join(result_parts)
-        return JSONResponse(content={"test_cases": result})
+
+        # 直接将 result 赋值给 answer
+        answer = result
+
+        match = re.search(r'</think>(.*)', result, re.DOTALL)
+        result = match.group(1) if match else result
+
+        # 提取结构化的测试用例信息
+        test_cases_structure = []
+        test_case_sections = re.split(r"### 测试用例", result)
+        for section in test_case_sections[1:]:  # 跳过第一个空字符串
+            test_case = {}
+            section = section.strip()
+
+            # 提取测试用例名称
+            name_match = re.search(r"#### 测试用例名称\n(.*?)\n\n", section, re.DOTALL)
+            if not name_match:
+                continue
+
+            test_case["测试用例名称"] = name_match.group(1).strip() if name_match else "无"
+
+            # 提取简要描述
+            desc_match = re.search(r"#### 简要描述\n(.*?)\n\n", section, re.DOTALL)
+            test_case["简要描述"] = desc_match.group(1).strip() if desc_match else "无"
+
+            # 提取初始化要求
+            init_match = re.search(r"#### 初始化要求\n(.*?)\n\n", section, re.DOTALL)
+            test_case["初始化要求"] = init_match.group(1).strip() if init_match else "无"
+
+            # 提取前提和约束
+            pre_match = re.search(r"#### 前提和约束\n(.*?)\n\n", section, re.DOTALL)
+            test_case["前提和约束"] = pre_match.group(1).strip() if pre_match else "无"
+
+            # 提取测试用例设计方法
+            method_match = re.search(r"#### 测试用例设计方法\n(.*?)\n\n", section, re.DOTALL)
+            test_case["测试用例设计方法"] = method_match.group(1).strip() if method_match else "无"
+
+            # 提取测试终止条件
+            normal_termination_match = re.search(r"#### 正常终止条件\n(.*?)\n\n", section, re.DOTALL)
+            test_case["正常终止条件"] = normal_termination_match.group(1).strip() if normal_termination_match else "无"
+
+            abnormal_termination_match = re.search(r"#### 异常终止条件\n(.*?)\n\n", section, re.DOTALL)
+            test_case["异常终止条件"] = abnormal_termination_match.group(1).strip() if abnormal_termination_match else "无"
+
+            # 提取测试过程描述
+            process_match = re.search(r"#### 测试过程描述\n(.*)", section, re.DOTALL)
+            test_case["测试过程描述"] = process_match.group(1).strip() if process_match else "无"
+
+            test_cases_structure.append(test_case)
+
+        return JSONResponse(content={"answer": answer, "test_cases": test_cases_structure})
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON data")
 
