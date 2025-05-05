@@ -439,6 +439,7 @@ async def requirement_generation(request: Request):
 
         rule_match = re.search(r"#### 规则与约束\n(.*)", result, re.DOTALL)
         requirement["规则与约束"] = rule_match.group(1).strip() if rule_match else "无"
+        requirement["规则与约束"] = requirement["规则与约束"].split("####")[0].strip()
 
         return JSONResponse(content={"answer": answer, "requirement": requirement})
     except json.JSONDecodeError:
@@ -528,15 +529,16 @@ async def outline_generation(request: Request):
 
         normal_criterion_match = re.search(r"#### 通过准则\n(.*)", result, re.DOTALL)
         outline_structure["通过准则"] = normal_criterion_match.group(1).strip() if normal_criterion_match else "无"
+        outline_structure["通过准则"] = outline_structure["通过准则"].split("####")[0].strip()
 
         return JSONResponse(content={"answer": answer, "outline": outline_structure})
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON data")
 
 
-# 5. 根据生成的测试大纲，生成测试用例
-@app.post("/case_generation")
-async def case_generation(request: Request):
+# 5. 从生成的测试大纲中提取测试用例概述
+@app.post("/case_extraction")
+async def case_extraction(request: Request):
     try:
         data = await request.json()
         outline = data.get('outline')
@@ -545,9 +547,52 @@ async def case_generation(request: Request):
         if not outline:
             raise HTTPException(status_code=400, detail="Missing test_outline")
 
+        prompt = llm.load_prompt("case_extraction")
+        examples = llm.load_examples("case_extraction")
+        full_prompt = prompt.format(rag_content=rag_content,
+                                    examples=examples,
+                                    outline=outline)
+        
+        result_parts = []
+        async for item in llm.model_chat_flow(messages + [{"role": "user", "content": full_prompt}]):
+            try:
+                item_data = json.loads(item.decode("utf-8").strip())
+                result_parts.append(item_data["answer"])
+            except json.JSONDecodeError:
+                pass
+        result = ''.join(result_parts)
+        answer = result
+
+        match = re.search(r'</think>(.*)', result, re.DOTALL)
+        result = match.group(1) if match else result
+
+        case_sections = result.strip().split("\n\n")
+        case_overviews = []
+        for section in case_sections:
+            if section[0].isdigit():
+                case_overviews.append(section.strip())
+
+        return JSONResponse(content={"answer": answer, "case_overviews": case_overviews})
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON data")
+
+
+# 6. 根据生成的测试大纲，生成测试用例
+@app.post("/case_generation")
+async def case_generation(request: Request):
+    try:
+        data = await request.json()
+        outline = data.get('outline')
+        overview = data.get('overview')
+        rag_content = data.get('rag_content', "")
+        messages = data.get('messages', [])
+        if not outline:
+            raise HTTPException(status_code=400, detail="Missing test_outline")
+
         prompt = llm.load_prompt("case_generation")
         examples = llm.load_examples("case_generation")
         full_prompt = prompt.format(rag_content=rag_content,
+                                    overview=overview,
                                     examples=examples,
                                     outline=outline)
 
@@ -568,7 +613,7 @@ async def case_generation(request: Request):
 
         # 提取结构化的测试用例信息
         test_cases_structure = []
-        test_case_sections = re.split(r"### 测试用例", result)
+        test_case_sections = result.split("\n### ")
         for section in test_case_sections[1:]:  # 跳过第一个空字符串
             test_case = {}
             section = section.strip()
@@ -606,7 +651,7 @@ async def case_generation(request: Request):
             # 提取测试过程描述
             process_match = re.search(r"#### 测试过程描述\n(.*)", section, re.DOTALL)
             test_case["测试过程描述"] = process_match.group(1).strip() if process_match else "无"
-
+            test_case["测试过程描述"] = test_case["测试过程描述"].split("####")[0].strip()
             test_cases_structure.append(test_case)
 
         return JSONResponse(content={"answer": answer, "test_cases": test_cases_structure})
